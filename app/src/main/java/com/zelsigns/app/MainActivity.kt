@@ -4,17 +4,16 @@ import android.content.Context
 import android.net.Uri
 import android.os.Bundle
 import android.provider.OpenableColumns
+import android.util.Base64
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.foundation.background
-import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -27,58 +26,39 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.android.apksig.ApkSigner
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
 import org.bouncycastle.asn1.x500.X500Name
 import org.bouncycastle.cert.jcajce.JcaX509CertificateConverter
 import org.bouncycastle.cert.jcajce.JcaX509v3CertificateBuilder
 import org.bouncycastle.jce.provider.BouncyCastleProvider
 import org.bouncycastle.operator.jcajce.JcaContentSignerBuilder
+import org.json.JSONObject
 import java.io.File
 import java.io.FileOutputStream
 import java.math.BigInteger
 import java.security.KeyPairGenerator
-import java.security.SecureRandom
 import java.security.Security
-import java.security.cert.X509Certificate
 import java.util.Date
 
-enum class Screen {
-    MAIN,
-    CONFIG,
-    SETTINGS,
-    PROGRESS
-}
+enum class Screen { MAIN, CONFIG, SETTINGS, PROGRESS }
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-
-        // Ensure BouncyCastle provider is registered safely
-        try {
-            if (Security.getProvider(BouncyCastleProvider.PROVIDER_NAME) == null) {
-                Security.addProvider(BouncyCastleProvider())
-            }
-        } catch (_: Exception) {
+        if (Security.getProvider(BouncyCastleProvider.PROVIDER_NAME) == null) {
+            Security.addProvider(BouncyCastleProvider())
         }
-
         setContent {
-            val darkColors = darkColorScheme(
-                primary = Color(0xFF00E676),
-                onPrimary = Color(0xFF000000),
-                secondary = Color(0xFF00B0FF),
-                background = Color(0xFF0A0D12),
-                surface = Color(0xFF121721),
-                onBackground = Color(0xFFECEFF4),
-                onSurface = Color(0xFFECEFF4)
-            )
-
-            MaterialTheme(colorScheme = darkColors) {
-                Surface(
-                    modifier = Modifier.fillMaxSize(),
-                    color = MaterialTheme.colorScheme.background
-                ) {
+            MaterialTheme(colorScheme = darkColorScheme(
+                primary = Color(0xFF00E676), background = Color(0xFF0A0D12), surface = Color(0xFF121721),
+                onBackground = Color(0xFFECEFF4), onSurface = Color(0xFFECEFF4)
+            )) {
+                Surface(modifier = Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
                     ZelSignsApp()
                 }
             }
@@ -86,98 +66,48 @@ class MainActivity : ComponentActivity() {
     }
 }
 
-/**
- * Resolves the real display name of a content URI strictly using
- * ContentResolver and OpenableColumns.DISPLAY_NAME (never uri.lastPathSegment).
- */
 fun resolveFileName(context: Context, uri: Uri): String {
     var displayName = "unknown_file"
-    val cursor = context.contentResolver.query(uri, null, null, null, null)
-    cursor?.use {
+    context.contentResolver.query(uri, null, null, null, null)?.use {
         if (it.moveToFirst()) {
-            val nameIndex = it.getColumnIndex(OpenableColumns.DISPLAY_NAME)
-            if (nameIndex != -1) {
-                val value = it.getString(nameIndex)
-                if (!value.isNullOrBlank()) {
-                    displayName = value
-                }
-            }
+            val idx = it.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+            if (idx != -1) displayName = it.getString(idx) ?: "unknown_file"
         }
     }
     return displayName
 }
 
-/**
- * Generates a self-signed RSA-2048 keypair + X.509 certificate via BouncyCastle
- * and signs the input APK locally using Android's official ApkSigner (v1 + v2 + v3).
- */
-suspend fun signApkLocally(
-    context: Context,
-    sourceUri: Uri,
-    originalFileName: String
-): Result<File> = withContext(Dispatchers.IO) {
+suspend fun signApkLocally(context: Context, sourceUri: Uri, originalFileName: String): Result<File> = withContext(Dispatchers.IO) {
     runCatching {
-        val provider = BouncyCastleProvider()
-        val tempInputFile = File(context.cacheDir, "unsigned_input_${System.currentTimeMillis()}.apk")
-
+        val tempInputFile = File(context.cacheDir, "input.apk")
         context.contentResolver.openInputStream(sourceUri)?.use { input ->
-            FileOutputStream(tempInputFile).use { output ->
-                input.copyTo(output)
-            }
-        } ?: throw IllegalStateException("Unable to read input APK stream")
+            FileOutputStream(tempInputFile).use { output -> input.copyTo(output) }
+        } ?: throw Exception("Unable to read stream")
 
         val outputDir = context.getExternalFilesDir(null) ?: context.filesDir
-        val baseName = originalFileName.removeSuffix(".apk").removeSuffix(".APK")
-        val signedOutputFile = File(outputDir, "${baseName}_zel_signed.apk")
-        if (signedOutputFile.exists()) {
-            signedOutputFile.delete()
-        }
+        val signedOutputFile = File(outputDir, "${originalFileName.removeSuffix(".apk")}_zel_signed.apk")
+        
+        val kpg = KeyPairGenerator.getInstance("RSA")
+        kpg.initialize(2048)
+        val keyPair = kpg.generateKeyPair()
 
-        // Generate 2048-bit RSA KeyPair
-        val keyPairGenerator = KeyPairGenerator.getInstance("RSA")
-        keyPairGenerator.initialize(2048, SecureRandom())
-        val keyPair = keyPairGenerator.generateKeyPair()
-
-        // Build X.509 v3 Certificate with BouncyCastle
         val now = System.currentTimeMillis()
-        val notBefore = Date(now - 86400000L)
-        val notAfter = Date(now + 25L * 365 * 24 * 60 * 60 * 1000L)
-        val serial = BigInteger.valueOf(now)
-        val subject = X500Name("CN=Zel Signs AutoSigner, OU=Android DevOps, O=ZelSigns, C=US")
-
+        val dnName = X500Name("CN=ZelSigns, O=Zel, C=US")
         val certBuilder = JcaX509v3CertificateBuilder(
-            subject,
-            serial,
-            notBefore,
-            notAfter,
-            subject,
-            keyPair.public
+            dnName, BigInteger.valueOf(now), Date(now), Date(now + 31536000000L), dnName, keyPair.public
         )
+        val signer = JcaContentSignerBuilder("SHA256withRSA").build(keyPair.private)
+        val cert = JcaX509CertificateConverter().setProvider("BC").getCertificate(certBuilder.build(signer))
 
-        val contentSigner = JcaContentSignerBuilder("SHA256WithRSA")
-            .build(keyPair.private)
-
-        val certHolder = certBuilder.build(contentSigner)
-        val certificate: X509Certificate = JcaX509CertificateConverter()
-            .setProvider(provider)
-            .getCertificate(certHolder)
-
-        val signerConfig = ApkSigner.SignerConfig.Builder(
-            "ZEL_SIGNS_KEY",
-            keyPair.private,
-            listOf(certificate)
-        ).build()
-
-        val apkSigner = ApkSigner.Builder(listOf(signerConfig))
+        val signerConfig = ApkSigner.SignerConfig.Builder("ZelKey", keyPair.private, listOf(cert)).build()
+        ApkSigner.Builder(listOf(signerConfig))
             .setInputApk(tempInputFile)
             .setOutputApk(signedOutputFile)
             .setV1SigningEnabled(true)
             .setV2SigningEnabled(true)
             .setV3SigningEnabled(true)
             .build()
-
-        apkSigner.sign()
-        tempInputFile.delete()
+            .sign()
 
         signedOutputFile
     }
@@ -187,490 +117,162 @@ suspend fun signApkLocally(
 fun ZelSignsApp() {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
-    val prefs = remember {
-        context.getSharedPreferences("zel_signs_prefs", Context.MODE_PRIVATE)
-    }
+    val prefs = remember { context.getSharedPreferences("zel_prefs", Context.MODE_PRIVATE) }
 
     var currentScreen by remember { mutableStateOf(Screen.MAIN) }
+    var selectedUri by remember { mutableStateOf<Uri?>(null) }
     var selectedFileName by remember { mutableStateOf("") }
-    var selectedFileUri by remember { mutableStateOf<Uri?>(null) }
-    var statusMessage by remember { mutableStateOf("Ready. Select an APK to sign locally, or ZIP/HTML to auto-build.") }
+    var statusMessage by remember { mutableStateOf("Ready.") }
     var isSigning by remember { mutableStateOf(false) }
+    
+    // Config State
+    var appName by remember { mutableStateOf("MyApp") }
+    
+    // Settings State
+    var githubPat by remember { mutableStateOf(prefs.getString("pat", "") ?: "") }
+    var aiApiKey by remember { mutableStateOf(prefs.getString("ai_key", "") ?: "") }
 
-    // Configuration Screen state
-    var appName by remember { mutableStateOf("My Zel WebApp") }
-    var customIconName by remember { mutableStateOf("Default (ic_launcher.xml)") }
-    var splashScreenName by remember { mutableStateOf("None selected") }
-
-    // Settings Screen state
-    var githubPat by remember { mutableStateOf(prefs.getString("github_pat", "") ?: "") }
-    var aiApiKey by remember { mutableStateOf(prefs.getString("ai_api_key", "") ?: "") }
-
-    // File Picker Launcher (*/*)
-    val mainFilePicker = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.GetContent()
-    ) { uri: Uri? ->
+    val filePicker = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
         if (uri != null) {
-            val resolvedName = resolveFileName(context, uri)
-            selectedFileUri = uri
-            selectedFileName = resolvedName
-            val lower = resolvedName.lowercase()
-
-            when {
-                lower.endsWith(".apk") -> {
-                    isSigning = true
-                    statusMessage = "Signing $resolvedName locally with ApkSigner + BouncyCastle..."
-                    scope.launch {
-                        val result = signApkLocally(context, uri, resolvedName)
-                        isSigning = false
-                        result.onSuccess { signedFile ->
-                            val msg = "Signed APK saved to: ${signedFile.absolutePath}"
-                            statusMessage = msg
-                            Toast.makeText(context, msg, Toast.LENGTH_LONG).show()
-                        }.onFailure { err ->
-                            val errMsg = "Signing error: ${err.localizedMessage ?: "Unknown failure"}"
-                            statusMessage = errMsg
-                            Toast.makeText(context, errMsg, Toast.LENGTH_LONG).show()
-                        }
-                    }
+            val name = resolveFileName(context, uri)
+            selectedUri = uri
+            selectedFileName = name
+            
+            if (name.lowercase().endsWith(".apk")) {
+                isSigning = true
+                statusMessage = "Signing locally..."
+                scope.launch {
+                    val result = signApkLocally(context, uri, name)
+                    isSigning = false
+                    result.onSuccess { statusMessage = "Success: ${it.absolutePath}" }
+                          .onFailure { statusMessage = "Failed: ${it.message}" }
                 }
-                lower.endsWith(".zip") || lower.endsWith(".html") -> {
-                    appName = resolvedName.substringBeforeLast(".")
-                        .replaceFirstChar { it.uppercase() }
-                    statusMessage = "Loaded archive/web source: $resolvedName"
-                    currentScreen = Screen.CONFIG
-                }
-                else -> {
-                    val unsupported = "Unsupported file ($resolvedName). Choose .apk, .zip, or .html"
-                    statusMessage = unsupported
-                    Toast.makeText(context, unsupported, Toast.LENGTH_SHORT).show()
-                }
+            } else if (name.lowercase().endsWith(".zip") || name.lowercase().endsWith(".html")) {
+                appName = name.substringBeforeLast(".")
+                currentScreen = Screen.CONFIG
             }
         }
     }
 
-    // Custom Icon Picker (image/*)
-    val iconPicker = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.GetContent()
-    ) { uri: Uri? ->
-        if (uri != null) {
-            customIconName = resolveFileName(context, uri)
-        }
-    }
-
-    // Splash Screen Picker (image/*)
-    val splashPicker = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.GetContent()
-    ) { uri: Uri? ->
-        if (uri != null) {
-            splashScreenName = resolveFileName(context, uri)
-        }
-    }
-
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .padding(20.dp)
-    ) {
-        // Header Bar
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(bottom = 16.dp),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            Column {
-                Text(
-                    text = "ZEL SIGNS",
-                    fontSize = 22.sp,
-                    fontWeight = FontWeight.ExtraBold,
-                    color = MaterialTheme.colorScheme.primary
-                )
-                Text(
-                    text = "APK Signer & AI Auto-Builder",
-                    fontSize = 12.sp,
-                    color = Color(0xFF94A3B8)
-                )
-            }
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                if (currentScreen != Screen.MAIN) {
-                    OutlinedButton(onClick = { currentScreen = Screen.MAIN }) {
-                        Text("Home")
-                    }
-                }
-                OutlinedButton(onClick = { currentScreen = Screen.SETTINGS }) {
-                    Text("Settings")
-                }
+    Column(modifier = Modifier.fillMaxSize().padding(20.dp)) {
+        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+            Text("ZEL SIGNS", fontSize = 22.sp, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.primary)
+            Row {
+                if (currentScreen != Screen.MAIN) OutlinedButton(onClick = { currentScreen = Screen.MAIN }) { Text("Home") }
+                Spacer(modifier = Modifier.width(8.dp))
+                OutlinedButton(onClick = { currentScreen = Screen.SETTINGS }) { Text("Settings") }
             }
         }
+        
+        Spacer(modifier = Modifier.height(24.dp))
 
         when (currentScreen) {
             Screen.MAIN -> {
-                MainScreenContent(
-                    selectedFileName = selectedFileName,
-                    statusMessage = statusMessage,
-                    isSigning = isSigning,
-                    onSelectFileClick = { mainFilePicker.launch("*/*") }
-                )
+                Button(onClick = { filePicker.launch("*/*") }, modifier = Modifier.fillMaxWidth().height(50.dp)) {
+                    Text("Select File (APK / ZIP / HTML)")
+                }
+                Spacer(modifier = Modifier.height(16.dp))
+                Text(statusMessage, fontFamily = FontFamily.Monospace, fontSize = 14.sp)
+                if (isSigning) CircularProgressIndicator(modifier = Modifier.padding(top = 16.dp))
             }
+            
             Screen.CONFIG -> {
-                ConfigScreenContent(
-                    sourceFileName = selectedFileName,
-                    appName = appName,
-                    onAppNameChange = { appName = it },
-                    customIconName = customIconName,
-                    splashScreenName = splashScreenName,
-                    onPickIcon = { iconPicker.launch("image/*") },
-                    onPickSplash = { splashPicker.launch("image/*") },
-                    onBuildViaGitHub = { currentScreen = Screen.PROGRESS }
-                )
-            }
-            Screen.SETTINGS -> {
-                SettingsScreenContent(
-                    githubPat = githubPat,
-                    onGithubPatChange = { githubPat = it },
-                    aiApiKey = aiApiKey,
-                    onAiApiKeyChange = { aiApiKey = it },
-                    onSave = {
-                        prefs.edit()
-                            .putString("github_pat", githubPat.trim())
-                            .putString("ai_api_key", aiApiKey.trim())
-                            .apply()
-                        Toast.makeText(
-                            context,
-                            "Credentials saved to SharedPreferences",
-                            Toast.LENGTH_SHORT
-                        ).show()
-                        currentScreen = Screen.MAIN
-                    }
-                )
-            }
-            Screen.PROGRESS -> {
-                ProgressScreenContent(
-                    sourceFileName = selectedFileName,
-                    appName = appName,
-                    customIconName = customIconName,
-                    splashScreenName = splashScreenName,
-                    hasPat = githubPat.isNotBlank(),
-                    hasAiKey = aiApiKey.isNotBlank(),
-                    onBackHome = { currentScreen = Screen.MAIN }
-                )
-            }
-        }
-    }
-}
-
-@Composable
-fun MainScreenContent(
-    selectedFileName: String,
-    statusMessage: String,
-    isSigning: Boolean,
-    onSelectFileClick: () -> Unit
-) {
-    Column(
-        modifier = Modifier.fillMaxSize(),
-        verticalArrangement = Arrangement.spacedBy(16.dp)
-    ) {
-        Card(
-            modifier = Modifier.fillMaxWidth(),
-            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
-            shape = RoundedCornerShape(12.dp)
-        ) {
-            Column(
-                modifier = Modifier.padding(20.dp),
-                verticalArrangement = Arrangement.spacedBy(12.dp)
-            ) {
-                Text(
-                    text = "Universal Build & Sign Pipeline",
-                    fontSize = 18.sp,
-                    fontWeight = FontWeight.Bold
-                )
-                Text(
-                    text = "• Pick an .apk file to perform local cryptographic V1/V2/V3 signing via BouncyCastle + ApkSigner.\n" +
-                            "• Pick a .zip or .html file to configure your Android wrapper and trigger the AI + GitHub Actions Auto-Builder.",
-                    fontSize = 13.sp,
-                    color = Color(0xFFB0BEC5)
-                )
-
-                Spacer(modifier = Modifier.height(4.dp))
-
+                Text("Configure App", fontSize = 20.sp, fontWeight = FontWeight.Bold)
+                Spacer(modifier = Modifier.height(16.dp))
+                OutlinedTextField(value = appName, onValueChange = { appName = it }, label = { Text("App Name") }, modifier = Modifier.fillMaxWidth())
+                Spacer(modifier = Modifier.height(24.dp))
                 Button(
-                    onClick = onSelectFileClick,
-                    enabled = !isSigning,
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .height(54.dp),
-                    shape = RoundedCornerShape(10.dp)
-                ) {
-                    Text(
-                        text = if (isSigning) "Signing APK..." else "Select File (APK/ZIP/HTML)",
-                        fontSize = 16.sp,
-                        fontWeight = FontWeight.Bold
-                    )
-                }
-            }
-        }
-
-        if (isSigning) {
-            LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
-        }
-
-        Card(
-            modifier = Modifier.fillMaxWidth(),
-            colors = CardDefaults.cardColors(containerColor = Color(0xFF0E131B)),
-            shape = RoundedCornerShape(12.dp)
-        ) {
-            Column(
-                modifier = Modifier.padding(16.dp),
-                verticalArrangement = Arrangement.spacedBy(8.dp)
-            ) {
-                Text(
-                    text = "TELEMETRY & OUTPUT",
-                    fontSize = 11.sp,
-                    fontWeight = FontWeight.Bold,
-                    color = MaterialTheme.colorScheme.primary
-                )
-                Text(
-                    text = "Selected File: ${selectedFileName.ifBlank { "None" }}",
-                    fontSize = 13.sp,
-                    fontFamily = FontFamily.Monospace
-                )
-                Text(
-                    text = statusMessage,
-                    fontSize = 13.sp,
-                    fontFamily = FontFamily.Monospace,
-                    color = Color(0xFF80CBC4)
-                )
-            }
-        }
-    }
-}
-
-@Composable
-fun ConfigScreenContent(
-    sourceFileName: String,
-    appName: String,
-    onAppNameChange: (String) -> Unit,
-    customIconName: String,
-    splashScreenName: String,
-    onPickIcon: () -> Unit,
-    onPickSplash: () -> Unit,
-    onBuildViaGitHub: () -> Unit
-) {
-    Column(
-        modifier = Modifier.fillMaxSize(),
-        verticalArrangement = Arrangement.spacedBy(14.dp)
-    ) {
-        Text(
-            text = "Configuration Screen",
-            fontSize = 20.sp,
-            fontWeight = FontWeight.Bold
-        )
-        Text(
-            text = "Source Payload: $sourceFileName",
-            fontSize = 13.sp,
-            fontFamily = FontFamily.Monospace,
-            color = MaterialTheme.colorScheme.primary
-        )
-
-        OutlinedTextField(
-            value = appName,
-            onValueChange = onAppNameChange,
-            label = { Text("App Name") },
-            modifier = Modifier.fillMaxWidth(),
-            singleLine = true
-        )
-
-        Card(
-            modifier = Modifier.fillMaxWidth(),
-            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
-        ) {
-            Column(
-                modifier = Modifier.padding(14.dp),
-                verticalArrangement = Arrangement.spacedBy(8.dp)
-            ) {
-                Text(text = "Custom Icon: $customIconName", fontSize = 13.sp)
-                OutlinedButton(
-                    onClick = onPickIcon,
-                    modifier = Modifier.fillMaxWidth()
-                ) {
-                    Text("Pick Custom Icon (image/*)")
-                }
-            }
-        }
-
-        Card(
-            modifier = Modifier.fillMaxWidth(),
-            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
-        ) {
-            Column(
-                modifier = Modifier.padding(14.dp),
-                verticalArrangement = Arrangement.spacedBy(8.dp)
-            ) {
-                Text(text = "Splash Screen: $splashScreenName", fontSize = 13.sp)
-                OutlinedButton(
-                    onClick = onPickSplash,
-                    modifier = Modifier.fillMaxWidth()
-                ) {
-                    Text("Pick Splash Screen (image/*)")
-                }
-            }
-        }
-
-        Spacer(modifier = Modifier.height(8.dp))
-
-        Button(
-            onClick = onBuildViaGitHub,
-            modifier = Modifier
-                .fillMaxWidth()
-                .height(54.dp),
-            shape = RoundedCornerShape(10.dp)
-        ) {
-            Text(
-                text = "Build via GitHub",
-                fontSize = 16.sp,
-                fontWeight = FontWeight.Bold
-            )
-        }
-    }
-}
-
-@Composable
-fun SettingsScreenContent(
-    githubPat: String,
-    onGithubPatChange: (String) -> Unit,
-    aiApiKey: String,
-    onAiApiKeyChange: (String) -> Unit,
-    onSave: () -> Unit
-) {
-    Column(
-        modifier = Modifier.fillMaxSize(),
-        verticalArrangement = Arrangement.spacedBy(16.dp)
-    ) {
-        Text(
-            text = "Settings Screen",
-            fontSize = 20.sp,
-            fontWeight = FontWeight.Bold
-        )
-        Text(
-            text = "Configure credentials for GitHub Actions & AI Auto-Builder. Persisted securely in SharedPreferences.",
-            fontSize = 13.sp,
-            color = Color(0xFF94A3B8)
-        )
-
-        OutlinedTextField(
-            value = githubPat,
-            onValueChange = onGithubPatChange,
-            label = { Text("GitHub PAT (ghp_...)") },
-            placeholder = { Text("ghp_xxxxxxxxxxxxxxxxxxxx") },
-            modifier = Modifier.fillMaxWidth(),
-            singleLine = true
-        )
-
-        OutlinedTextField(
-            value = aiApiKey,
-            onValueChange = onAiApiKeyChange,
-            label = { Text("AI API Key") },
-            placeholder = { Text("sk-xxxxxxxxxxxxxxxxxxxx") },
-            modifier = Modifier.fillMaxWidth(),
-            singleLine = true
-        )
-
-        Button(
-            onClick = onSave,
-            modifier = Modifier
-                .fillMaxWidth()
-                .height(52.dp),
-            shape = RoundedCornerShape(10.dp)
-        ) {
-            Text(
-                text = "Save Credentials",
-                fontSize = 16.sp,
-                fontWeight = FontWeight.Bold
-            )
-        }
-    }
-}
-
-@Composable
-fun ProgressScreenContent(
-    sourceFileName: String,
-    appName: String,
-    customIconName: String,
-    splashScreenName: String,
-    hasPat: Boolean,
-    hasAiKey: Boolean,
-    onBackHome: () -> Unit
-) {
-    val logs = remember { mutableStateListOf<String>() }
-    var isCompleted by remember { mutableStateOf(false) }
-
-    LaunchedEffect(Unit) {
-        logs.clear()
-        val steps = listOf(
-            "[00:00] Initializing Zel Signs AI Auto-Builder loop...",
-            "[00:02] Verifying SharedPreferences credentials (GitHub PAT: ${if (hasPat) "Configured" else "Mock/Demo Mode"}, AI Key: ${if (hasAiKey) "Configured" else "Mock/Demo Mode"})...",
-            "[00:04] Inspecting payload '$sourceFileName' via OpenableColumns.DISPLAY_NAME...",
-            "[00:06] AI Agent synthesizing Android WebView + Jetpack Compose scaffold for '$appName'...",
-            "[00:08] Injecting assets -> Icon: '$customIconName' | Splash: '$splashScreenName'...",
-            "[00:10] Pushing commit to GitHub repository & dispatching '.github/workflows/build-apk.yml'...",
-            "[00:12] GitHub Runner (ubuntu-latest, JDK 17, Gradle 8.7, AGP 8.4.0) running ':app:assembleDebug'...",
-            "[00:14] Build succeeded! Artifact 'zel-signs-apk' signed with BouncyCastle + ApkSigner Ready."
-        )
-        for (step in steps) {
-            logs.add(step)
-            delay(2000L)
-        }
-        isCompleted = true
-    }
-
-    Column(
-        modifier = Modifier.fillMaxSize(),
-        verticalArrangement = Arrangement.spacedBy(14.dp)
-    ) {
-        Text(
-            text = "GitHub & AI Build Progress",
-            fontSize = 20.sp,
-            fontWeight = FontWeight.Bold
-        )
-
-        if (!isCompleted) {
-            LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
-        }
-
-        Box(
-            modifier = Modifier
-                .weight(1f)
-                .fillMaxWidth()
-                .background(Color(0xFF070A0E), RoundedCornerShape(10.dp))
-                .border(1.dp, Color(0xFF1E293B), RoundedCornerShape(10.dp))
-                .padding(14.dp)
-        ) {
-            LazyColumn(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                items(logs) { logLine ->
-                    Text(
-                        text = logLine,
-                        fontFamily = FontFamily.Monospace,
-                        fontSize = 12.sp,
-                        color = if (logLine.contains("Build succeeded")) {
-                            Color(0xFF00E676)
-                        } else {
-                            Color(0xFFE2E8F0)
+                    onClick = { 
+                        if (githubPat.isBlank()) {
+                            Toast.makeText(context, "Please set GitHub PAT in Settings", Toast.LENGTH_LONG).show()
+                        } else if (selectedUri != null) {
+                            currentScreen = Screen.PROGRESS 
                         }
-                    )
+                    }, 
+                    modifier = Modifier.fillMaxWidth().height(50.dp)
+                ) {
+                    Text("Build via GitHub")
+                }
+            }
+
+            Screen.SETTINGS -> {
+                Text("Settings", fontSize = 20.sp, fontWeight = FontWeight.Bold)
+                Spacer(modifier = Modifier.height(16.dp))
+                OutlinedTextField(value = githubPat, onValueChange = { githubPat = it }, label = { Text("GitHub PAT (ghp_...)") }, modifier = Modifier.fillMaxWidth())
+                Spacer(modifier = Modifier.height(16.dp))
+                OutlinedTextField(value = aiApiKey, onValueChange = { aiApiKey = it }, label = { Text("AI API Key") }, modifier = Modifier.fillMaxWidth())
+                Spacer(modifier = Modifier.height(24.dp))
+                Button(onClick = { 
+                    prefs.edit().putString("pat", githubPat).putString("ai_key", aiApiKey).apply()
+                    Toast.makeText(context, "Saved", Toast.LENGTH_SHORT).show()
+                    currentScreen = Screen.MAIN
+                }, modifier = Modifier.fillMaxWidth()) {
+                    Text("Save")
+                }
+            }
+
+            Screen.PROGRESS -> {
+                // REAL GITHUB API LOGIC STARTS HERE
+                var log by remember { mutableStateOf("Initializing GitHub API push...") }
+                
+                LaunchedEffect(Unit) {
+                    if (selectedUri != null) {
+                        log = "Uploading $selectedFileName to GitHub..."
+                        val result = pushToGitHub(context, selectedUri!!, selectedFileName, githubPat)
+                        log = result
+                    }
+                }
+                
+                Column(modifier = Modifier.fillMaxSize(), verticalArrangement = Arrangement.Center, horizontalAlignment = Alignment.CenterHorizontally) {
+                    CircularProgressIndicator(color = MaterialTheme.colorScheme.primary)
+                    Spacer(modifier = Modifier.height(24.dp))
+                    Text(log, fontFamily = FontFamily.Monospace, fontSize = 14.sp, modifier = Modifier.padding(16.dp))
+                    Spacer(modifier = Modifier.height(24.dp))
+                    Button(onClick = { currentScreen = Screen.MAIN }) { Text("Back to Home") }
                 }
             }
         }
+    }
+}
 
-        Button(
-            onClick = onBackHome,
-            enabled = isCompleted,
-            modifier = Modifier
-                .fillMaxWidth()
-                .height(50.dp)
-        ) {
-            Text(if (isCompleted) "Finish & Return Home" else "Running CI/CD Loop...")
-        }
+// --- REAL GITHUB API NETWORKING ---
+suspend fun pushToGitHub(context: Context, zipUri: Uri, fileName: String, pat: String): String = withContext(Dispatchers.IO) {
+    try {
+        val client = OkHttpClient()
+        val jsonMediaType = "application/json; charset=utf-8".toMediaType()
+
+        // 1. Get User Info
+        val userReq = Request.Builder().url("https://api.github.com/user")
+            .header("Authorization", "Bearer $pat").build()
+        val userRes = client.newCall(userReq).execute()
+        if (!userRes.isSuccessful) return@withContext "Auth Failed: Check your GitHub PAT"
+        
+        val username = JSONObject(userRes.body?.string() ?: "{}").getString("login")
+        val repoName = "zel-build-${System.currentTimeMillis()}"
+
+        // 2. Create Repo
+        val repoBody = JSONObject().put("name", repoName).put("private", false).toString().toRequestBody(jsonMediaType)
+        val repoReq = Request.Builder().url("https://api.github.com/user/repos")
+            .header("Authorization", "Bearer $pat").post(repoBody).build()
+        client.newCall(repoReq).execute()
+
+        // 3. Upload ZIP as Base64
+        val bytes = context.contentResolver.openInputStream(zipUri)?.readBytes() ?: return@withContext "File Read Error"
+        val base64Zip = Base64.encodeToString(bytes, Base64.NO_WRAP)
+        
+        val fileBody = JSONObject().put("message", "Upload source zip").put("content", base64Zip).toString().toRequestBody(jsonMediaType)
+        val fileReq = Request.Builder().url("https://api.github.com/repos/$username/$repoName/contents/source.zip")
+            .header("Authorization", "Bearer $pat").put(fileBody).build()
+        client.newCall(fileReq).execute()
+
+        // 4. Trigger GitHub Action
+        val dispatchBody = JSONObject().put("ref", "main").toString().toRequestBody(jsonMediaType)
+        val dispatchReq = Request.Builder().url("https://api.github.com/repos/$username/$repoName/actions/workflows/build-apk.yml/dispatches")
+            .header("Authorization", "Bearer $pat").post(dispatchBody).build()
+        client.newCall(dispatchReq).execute()
+
+        "Success! Repo created & Action triggered.\nGo to github.com/$username/$repoName to watch the build."
+    } catch (e: Exception) {
+        "Network Error: ${e.message}"
     }
 }
