@@ -256,22 +256,62 @@ suspend fun pushToGitHub(context: Context, zipUri: Uri, fileName: String, pat: S
             .header("Authorization", "Bearer $pat").post(repoBody).build()
         client.newCall(repoReq).execute()
 
-        // 3. Upload ZIP as Base64
+        // 3. Upload ZIP
         val bytes = context.contentResolver.openInputStream(zipUri)?.readBytes() ?: return@withContext "File Read Error"
         val base64Zip = Base64.encodeToString(bytes, Base64.NO_WRAP)
+        val zipBody = JSONObject().put("message", "Upload source zip").put("content", base64Zip).toString().toRequestBody(jsonMediaType)
+        val zipReq = Request.Builder().url("https://api.github.com/repos/$username/$repoName/contents/source.zip")
+            .header("Authorization", "Bearer $pat").put(zipBody).build()
+        val zipRes = client.newCall(zipReq).execute()
+        if (!zipRes.isSuccessful) return@withContext "Zip Upload Failed: ${zipRes.code}"
+
+        // 4. Upload the Workflow File to the NEW repo!
+        val workflowYaml = """
+            name: Build APK
+            on:
+              push:
+                branches: [main, master]
+              workflow_dispatch:
+            jobs:
+              build:
+                runs-on: ubuntu-latest
+                steps:
+                  - uses: actions/checkout@v4
+                  - name: Unzip Source Code
+                    run: unzip source.zip -d build_dir
+                  - uses: actions/setup-java@v4
+                    with:
+                      distribution: temurin
+                      java-version: "17"
+                  - uses: android-actions/setup-android@v4
+                    with:
+                      packages: 'platform-tools'
+                  - run: yes | sdkmanager --licenses > /dev/null || true; sdkmanager "platforms;android-34" "build-tools;34.0.0"
+                  - name: Build APK
+                    working-directory: build_dir
+                    run: |
+                      wget -q https://services.gradle.org/distributions/gradle-8.7-bin.zip
+                      unzip -q gradle-8.7-bin.zip
+                      ./gradle-8.7/bin/gradle :app:assembleDebug --stacktrace --no-daemon
+                  - uses: actions/upload-artifact@v4
+                    with:
+                      name: zel-game-apk
+                      path: build_dir/app/build/outputs/apk/debug/*.apk
+        """.trimIndent()
+
+        val base64Workflow = Base64.encodeToString(workflowYaml.toByteArray(), Base64.NO_WRAP)
+        val workflowBody = JSONObject().put("message", "Add workflow").put("content", base64Workflow).toString().toRequestBody(jsonMediaType)
         
-        val fileBody = JSONObject().put("message", "Upload source zip").put("content", base64Zip).toString().toRequestBody(jsonMediaType)
-        val fileReq = Request.Builder().url("https://api.github.com/repos/$username/$repoName/contents/source.zip")
-            .header("Authorization", "Bearer $pat").put(fileBody).build()
-        client.newCall(fileReq).execute()
+        // The URL needs the exact path to the workflow
+        val workflowReq = Request.Builder().url("https://api.github.com/repos/$username/$repoName/contents/.github/workflows/build-apk.yml")
+            .header("Authorization", "Bearer $pat").put(workflowBody).build()
+        val workflowRes = client.newCall(workflowReq).execute()
+        
+        if (!workflowRes.isSuccessful) {
+            return@withContext "Workflow Upload Failed: ${workflowRes.code} - ${workflowRes.body?.string()}"
+        }
 
-        // 4. Trigger GitHub Action
-        val dispatchBody = JSONObject().put("ref", "main").toString().toRequestBody(jsonMediaType)
-        val dispatchReq = Request.Builder().url("https://api.github.com/repos/$username/$repoName/actions/workflows/build-apk.yml/dispatches")
-            .header("Authorization", "Bearer $pat").post(dispatchBody).build()
-        client.newCall(dispatchReq).execute()
-
-        "Success! Repo created & Action triggered.\nGo to github.com/$username/$repoName to watch the build."
+        "Success! Game ZIP and Workflow uploaded.\nGo to github.com/$username/$repoName to watch the build."
     } catch (e: Exception) {
         "Network Error: ${e.message}"
     }
