@@ -1,4 +1,4 @@
-name: Build APK
+name: Build Zel Signs APK
 on:
   push:
     branches: [main, master]
@@ -9,28 +9,30 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       
-      - name: Unzip Source Code
-        run: unzip source.zip -d build_dir
-        
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: "17"
           
+      - name: Accept Android SDK Licenses Manually
+        run: yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses || true
+        
       - uses: android-actions/setup-android@v4
         with:
           packages: 'platform-tools'
           
       - run: yes | sdkmanager --licenses > /dev/null || true; sdkmanager "platforms;android-34" "build-tools;34.0.0"
       
-      - name: Build APK
-        working-directory: build_dir
+      - name: Install Gradle manually
         run: |
           wget -q https://services.gradle.org/distributions/gradle-8.7-bin.zip
           unzip -q gradle-8.7-bin.zip
-          ./gradle-8.7/bin/gradle :app:assembleDebug --stacktrace --no-daemon
+          echo "$PWD/gradle-8.7/bin" >> $GITHUB_PATH
           
+      - name: Build APK
+        run: gradle :app:assembleDebug --stacktrace --no-daemon
+        
       - uses: actions/upload-artifact@v4
         with:
-          name: zel-builds-apk
-          path: build_dir/app/build/outputs/apk/debug/*.apk
+          name: zel-signs-apk
+          path: app/build/outputs/apk/debug/*.apk
